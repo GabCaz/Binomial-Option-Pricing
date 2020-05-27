@@ -1,5 +1,3 @@
-//  Created by Gabriel Cazaubieilh on 01/02/2020.
-
 #include "option.h"
 #include <math.h>
 #include <cmath>
@@ -13,12 +11,18 @@ Option::Option(double K, double T, double sigma, double r) {
     this->r = r;
 }
 
-double Option::getBinomialTreeValue(double s, int N) {
+double Option::getBinomialTreeValue(double s, int N, double contDivYield) {
     std::vector<double> treeValues(N + 1); // holds tree node values
     double deltaT = this->T / N;
     double up = exp(this->sigma * sqrt(deltaT)); // by how much go up when goes up
-    double p0 = (up - exp(-r * deltaT)) / (up * up - 1);
-    double p1 = exp(-r * deltaT) - p0; 
+    double down = 1 / up;
+    double p0;
+    if (contDivYield == -1.0) {
+        p0 = (exp(r * deltaT) - down) / (up - down); // RNP up
+    } else {
+        p0 = (exp((r - contDivYield) * deltaT) - down) / (up - down); // RNP up
+    }
+    double p1 = 1 - p0; // RNP down
     // get exercice values at expiration
     for(int i = 0; i <= N; i++) {
         // going up i times out of N times
@@ -34,22 +38,26 @@ double Option::getBinomialTreeValue(double s, int N) {
             // exercise value at this time (this current spot, this time)
             double exercise = getExerciseValue(currentSpot, t);
             // at this node, tree values are...
-            treeValues[i] = p0 * treeValues[i + 1] + p1 * treeValues[i];
+            treeValues[i] = (p0 * treeValues[i + 1] + p1 * treeValues[i]) * exp(-r * deltaT);
             // check for early exercise
             if (treeValues[i] < exercise) {
                 treeValues[i] = exercise;
             }
         }
     }
+//    std::cout << "position 1   " << treeValues[1] << std::endl;
+//    std::cout << "position 2   " << treeValues[2] << std::endl;
     return treeValues[0];
 }
 
 double Option::getd1(double s) {
-    return (1 / (this->sigma * sqrt(this->T))) * (log(s / this->K) + (this->r + this->sigma * this->sigma / 2) * this->T);
+    double d1 = (1 / (this->sigma * sqrt(this->T))) * (log(s / this->K) + (this->r + this->sigma * this->sigma / 2) * this->T);
+    return d1;
 }
 
 double Option::getd2(double s) {
-    return this->getd1(s) - this->sigma * sqrt(this->T);
+    double d2 = this->getd1(s) - this->sigma * sqrt(this->T);
+    return d2;
 }
 
 double Option::normalCDF(double x) {
@@ -104,7 +112,16 @@ AmericanPut::AmericanPut(double K, double T, double sigma, double r): AmericanOp
 KnockOutCall::KnockOutCall(double K, double T, double sigma, double r, double B): KnockOutOption(K, T, sigma, r, B) {
 }
 
+CompoundEuropeanCall::CompoundEuropeanCall(double K, double T, double sigma, double r): EuropeanOption(K, T, sigma, r) {
+}
+
 KnockOutPut::KnockOutPut(double K, double T, double sigma, double r, double B): KnockOutOption(K, T, sigma, r, B) {
+}
+
+ReloadableCallOption::ReloadableCallOption(double K, double T, double sigma, double r):AmericanOption(K, T, sigma, r) {
+}
+
+ExtendibleCall::ExtendibleCall(double K, double T, double sigma, double r):AmericanOption(K, T, sigma, r) {
 }
 
 double AmericanCall::getExerciseValue(double s, double t) {
@@ -113,6 +130,46 @@ double AmericanCall::getExerciseValue(double s, double t) {
 
 double AmericanPut::getExerciseValue(double s, double t) {
     return std::max(0.0, this->K - s);
+}
+
+// the payoff comes in two parts
+double ReloadableCallOption::getExerciseValue(double s, double t) {
+    // 1) 'Call payoff' part: max(price - strike, 0)
+    double callPart = std::max(0.0, s - this->K);
+    if (t == this->T) {
+        return callPart;
+    }
+    // 2) new option part: get new options...
+    // number: the number of shares it takes to pay the strike when exercising
+    double numNewOptions = this->K / s;
+    // Compute the value of the new option you would receive a fraction of
+    // same strike and expiration
+    EuropeanCall newCall(this->K, this->T - t, this->sigma, this->r);
+    double valNewCall = newCall.getBinomialTreeValue(s, 100);
+    return numNewOptions * valNewCall + callPart;
+}
+
+/*
+PURPOSE: calculate exercise (= intrinsic) value of Extendible American call
+INPUT: two doubles
+    s: the spot price
+    t: time
+OUTPUT: a double, intrinsic value for the call
+ */
+double ExtendibleCall::getExerciseValue(double s, double t) {
+    // Payoff if you choose to exercise at t
+    // /!\ Assumptions: The extended call has maturity same as initial call, and
+    // strike 1 higher
+    double exercise = s - this->K;
+    // Payoff if you choose to extend until 2 t (ie add t years)
+    AmericanCall extended(this->K + 1, this->T, this->sigma, this->r);
+    double extendVal = extended.getBlackScholesValue(s);
+    return std::max(exercise, extendVal);
+}
+
+double ReloadableCallOption::getBlackScholesValue(double s) {
+    throw "Do not use Black-Scholes for Reloadable Call yet";
+    return -1;
 }
 
 double EuropeanCall::getExerciseValue(double s, double t) {
@@ -129,8 +186,36 @@ double EuropeanPut::getExerciseValue(double s, double t) {
     return std::max(0.0, this->K - s);
 }
 
+double CompoundEuropeanCall::getExerciseValue(double s, double t) {
+    double t2 = 6.0/12;
+    double k2 = 90.0;
+    // If this is not maturity yet, the value is 0
+    if (this->T != t) {
+        return 0;
+    }
+    // Computing the price of the underlying European call at maturity
+    double remainingTimeForUnderlying = t2 - this->T; // time before maturity of underlying option
+    // Create the object corresponding to the underlying European call option
+    EuropeanCall underlyingCall(k2, remainingTimeForUnderlying, sigma, r);
+    // Value the underlying European call option with Binomial tree
+    double val = underlyingCall.getBinomialTreeValue(s, 30);
+    // consider we can buy this underlying option for the strike price K
+//    std::cout << "The value of the underlying option is " << val << std::endl;
+    return std::max(0.0, val - this->K);
+}
+
 double EuropeanCall::getBlackScholesValue(double s) {
     return normalCDF(getd1(s)) * s - normalCDF(getd2(s)) * this->K * exp(- r * this->T);
+}
+
+double CompoundEuropeanCall::getBlackScholesValue(double s) {
+    std::cout << "Standard Black Scholes should not be used on Compound Call";
+    return -1;
+}
+
+double ExtendibleCall::getBlackScholesValue(double s) {
+    std::cout << "Standard Black Scholes should not be used on Extendible Call";
+    return -1;
 }
 
 double EuropeanPut::getBlackScholesValue(double s) {
